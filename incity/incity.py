@@ -8,18 +8,73 @@ from discord.ext import commands
 logger = logging.getLogger("Modmail")
 
 # ------------------------------ CONFIG ------------------------------
-CHANNEL_ID = 1506363908405854424  # channel where the messages are sent
+CHANNEL_ID = 1506363879121354884  # channel where the city messages are sent
 ROLE_ID = 1563945182599057568  # <-- REPLACE with the ID of your "in city" role
+
+# ---- .city messages ------------------------------------------------
+# Placeholders: {user} (mention), {time} (timestamp)
+ENABLE_MESSAGE = "{user} is in city at {time}."
+DISABLE_MESSAGE = "{user} left the city at {time}."
+REMINDER_MESSAGE = "{user}, are you still in the city?"
+
 REMINDER_DELAY = 1 * 60  # seconds until the first reminder (1 hour)
 REPING_DELAY = 1 * 60  # seconds between re-pings if they don't respond (15 min)
+COMMAND_DELETE_DELAY = 3  # seconds the bot's 👍 stays visible when disabling, before the command message is deleted
 THUMBS_UP = "\N{THUMBS UP SIGN}"
 THUMBS_DOWN = "\N{THUMBS DOWN SIGN}"
+
+# ---- .who ----------------------------------------------------------
+WHO_EMPTY_MESSAGE = "No one is in the city right now."  # sent when nobody has the role
+WHO_TITLE = "Who's in the city"
+WHO_COLOR = 0x3498DB  # embed color (hex)
+WHO_ENTRY = "{user} — since {time}"  # one line per person. Placeholders: {user}, {time}, {ago}
+WHO_FOOTER = "{count} in the city"  # Placeholders: {count}. Use "" for no footer
+
+# ---- .time ---------------------------------------------------------
+TIME_EMPTY_MESSAGE = "Nobody has a city record yet."
+TIME_TITLE = "City records"
+TIME_COLOR = 0x2ECC71  # embed color (hex)
+TIME_ENTRY = "**{rank}.** {user} — {count}"  # Placeholders: {rank}, {user}, {count}
+TIME_FOOTER = "{people} people · {total} total"  # Placeholders: {people}, {total}. Use "" for no footer
+TIME_VIEW_MESSAGE = "{user} has enabled the city {count} time(s)."  # {user}, {count}
+TIME_CHANGE_MESSAGE = "{admin} set {user}'s city record to {count}."  # {user}, {count}, {admin}
+TIME_NO_PERMISSION_MESSAGE = "You need the Administrator permission to change records."
+TIME_INVALID_MESSAGE = "The record must be 0 or higher."
 # --------------------------------------------------------------------
+
+NO_MENTIONS = discord.AllowedMentions.none()
+
+
+class _SafeDict(dict):
+    """Leaves unknown {placeholders} as-is instead of crashing on a typo."""
+
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+
+def render(template: str, **values) -> str:
+    return template.format_map(_SafeDict(values))
 
 
 def now_stamp() -> str:
     """Discord timestamp (shows in each viewer's own timezone), e.g. 4:20 PM."""
     return f"<t:{int(time.time())}:t>"
+
+
+def fmt(template: str, user_id: int) -> str:
+    return render(template, user=f"<@{user_id}>", time=now_stamp())
+
+
+def join_lines(lines, limit: int = 4000) -> str:
+    """Join lines for an embed description, trimming if it gets too long."""
+    out, used = [], 0
+    for i, line in enumerate(lines):
+        if used + len(line) + 1 > limit:
+            out.append(f"…and {len(lines) - i} more")
+            break
+        out.append(line)
+        used += len(line) + 1
+    return "\n".join(out)
 
 
 class City(commands.Cog):
@@ -33,7 +88,8 @@ class City(commands.Cog):
 
     async def cog_load(self):
         """Restore timers/reminders saved in the database (survives restarts)."""
-        async for doc in self.coll.find({}):
+        # Timer docs have a "due" field (records for .time are stored separately).
+        async for doc in self.coll.find({"due": {"$exists": True}}):
             user_id = doc["_id"]
             ids = doc.get("reminder_ids")
             if ids is None and doc.get("reminder_id"):  # older saved format
@@ -52,6 +108,26 @@ class City(commands.Cog):
     async def _get_channel(self):
         return self.bot.get_channel(CHANNEL_ID) or await self.bot.fetch_channel(CHANNEL_ID)
 
+    async def _delete_message(self, message: discord.Message):
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass  # already gone, or missing Manage Messages
+
+    async def _delete_reminders(self, message_ids):
+        """Delete the bot's reminder messages in the city channel."""
+        if not message_ids:
+            return
+        try:
+            channel = await self._get_channel()
+        except discord.HTTPException:
+            return
+        for message_id in message_ids:
+            try:
+                await channel.get_partial_message(message_id).delete()
+            except discord.HTTPException:
+                pass  # already deleted
+
     def _cancel_task(self, user_id: int):
         task = self.tasks.pop(user_id, None)
         if task:
@@ -61,22 +137,24 @@ class City(commands.Cog):
         self._cancel_task(user_id)
         self.tasks[user_id] = asyncio.create_task(self._timer(user_id, delay))
 
-    async def _start_timer(self, user_id: int, delay: float = REMINDER_DELAY):
-        """(Re)start the 1 hour timer and save it to the database."""
+    async def _start_timer(self, user_id: int, delay: float = REMINDER_DELAY, entering: bool = False):
+        """(Re)start the 1 hour timer, save it, and delete any old reminders.
+        entering=True marks the moment the person entered the city (used by .who)."""
         self._cancel_task(user_id)
-        self.pending.pop(user_id, None)
-        await self.coll.replace_one(
-            {"_id": user_id},
-            {"_id": user_id, "due": time.time() + delay, "reminder_ids": []},
-            upsert=True,
-        )
+        old_ids = self.pending.pop(user_id, set())
+        update = {"due": time.time() + delay, "reminder_ids": []}
+        if entering:
+            update["since"] = time.time()
+        await self.coll.update_one({"_id": user_id}, {"$set": update}, upsert=True)
         self._schedule(user_id, delay)
+        await self._delete_reminders(old_ids)
 
     async def _clear(self, user_id: int):
-        """Forget everything about this user's timer/reminders."""
+        """Forget this user's timer and delete any outstanding reminders."""
         self._cancel_task(user_id)
-        self.pending.pop(user_id, None)
+        old_ids = self.pending.pop(user_id, set())
         await self.coll.delete_one({"_id": user_id})
+        await self._delete_reminders(old_ids)
 
     async def _timer(self, user_id: int, delay: float):
         """Wait, send the reminder, then keep re-pinging until this task is cancelled
@@ -95,7 +173,7 @@ class City(commands.Cog):
 
     async def _send_reminder(self, user_id: int):
         channel = await self._get_channel()
-        msg = await channel.send(f"<@{user_id}>, have you left the city yet?")
+        msg = await channel.send(fmt(REMINDER_MESSAGE, user_id))
         self.pending.setdefault(user_id, set()).add(msg.id)
         await self.coll.update_one(
             {"_id": user_id},
@@ -121,41 +199,172 @@ class City(commands.Cog):
             await member.remove_roles(role, reason="Left the city")
 
         channel = await self._get_channel()
-        await channel.send(f"{member.mention} left the city at {now_stamp()}.")
+        await channel.send(fmt(DISABLE_MESSAGE, user_id))
 
-    # ----------------------------- command -----------------------------
+    # ---- records (.time) ----
+
+    async def _add_record(self, user_id: int):
+        await self.coll.update_one(
+            {"_id": f"count:{user_id}"},
+            {"$inc": {"count": 1}, "$set": {"user_id": user_id}},
+            upsert=True,
+        )
+
+    async def _get_record(self, user_id: int) -> int:
+        doc = await self.coll.find_one({"_id": f"count:{user_id}"})
+        return doc["count"] if doc else 0
+
+    # ----------------------------- .city -------------------------------
 
     @commands.command()
     @commands.guild_only()
-    async def city(self, ctx):
-        """Toggle your "in city" role."""
+    async def city(self, ctx, member: discord.Member = None):
+        """Toggle the "in city" role for yourself, or for someone else: city @user"""
+        member = member or ctx.author
+        try:
+            await self._toggle(ctx, member)
+        finally:
+            await self._delete_message(ctx.message)  # clean up the command message
+
+    async def _toggle(self, ctx, member: discord.Member):
         role = ctx.guild.get_role(ROLE_ID)
         if role is None:
-            return await ctx.send("The city role wasn't found. Check `ROLE_ID` in the plugin.")
+            await ctx.send("The city role wasn't found. Check `ROLE_ID` in the plugin.")
+            return
 
-        member = ctx.author
-
-        # Already has the role -> disable (this also stops any re-pings)
+        # Already has the role -> disable
         if role in member.roles:
-            await ctx.message.add_reaction(THUMBS_UP)
+            try:
+                await ctx.message.add_reaction(THUMBS_UP)
+            except discord.HTTPException:
+                pass
             try:
                 await self._leave_city(ctx.guild, member.id)
             except discord.Forbidden:
                 await ctx.send("I don't have permission to remove that role.")
+                return
+            await asyncio.sleep(COMMAND_DELETE_DELAY)  # let the 👍 be seen
             return
 
         # Doesn't have the role -> enable
         try:
-            await member.add_roles(role, reason="Entered the city")
+            await member.add_roles(role, reason=f"Entered the city (set by {ctx.author})")
         except discord.Forbidden:
-            return await ctx.send(
+            await ctx.send(
                 "I don't have permission to give that role. "
                 "Make sure I have **Manage Roles** and my role is above it."
             )
+            return
+
+        await self._add_record(member.id)  # +1 on their .time record
 
         channel = await self._get_channel()
-        await channel.send(f"{member.mention} is in city at {now_stamp()}.")
-        await self._start_timer(member.id)
+        await channel.send(fmt(ENABLE_MESSAGE, member.id))
+        await self._start_timer(member.id, entering=True)
+
+    # ------------------------------ .who -------------------------------
+
+    @commands.command(name="who")
+    @commands.guild_only()
+    async def who(self, ctx):
+        """Show who is currently in the city."""
+        try:
+            role = ctx.guild.get_role(ROLE_ID)
+            if role is None:
+                await ctx.send("The city role wasn't found. Check `ROLE_ID` in the plugin.")
+                return
+
+            members = role.members
+            if not members:
+                await ctx.send(WHO_EMPTY_MESSAGE)
+                return
+
+            ids = [m.id for m in members]
+            docs = {d["_id"]: d async for d in self.coll.find({"_id": {"$in": ids}})}
+
+            # Oldest entry first; people with an unknown entry time go last
+            entries = [(docs.get(m.id, {}).get("since"), m) for m in members]
+            entries.sort(key=lambda e: (e[0] is None, e[0] or 0, e[1].display_name.lower()))
+
+            lines = []
+            for since, m in entries:
+                if since:
+                    when, ago = f"<t:{int(since)}:t>", f"<t:{int(since)}:R>"
+                else:
+                    when = ago = "unknown"
+                lines.append(render(WHO_ENTRY, user=m.mention, time=when, ago=ago))
+
+            embed = discord.Embed(title=WHO_TITLE, description=join_lines(lines), color=WHO_COLOR)
+            if WHO_FOOTER:
+                embed.set_footer(text=render(WHO_FOOTER, count=len(entries)))
+            await ctx.send(embed=embed)
+        finally:
+            await self._delete_message(ctx.message)
+
+    # ------------------------------ .time ------------------------------
+
+    @commands.group(name="time", invoke_without_command=True)
+    @commands.guild_only()
+    async def time_group(self, ctx):
+        """Show how many times each person has enabled the city.
+        Subcommands: time view [@user], time change @user <number> (admins)"""
+        try:
+            cursor = self.coll.find({"count": {"$gt": 0}}).sort([("count", -1), ("user_id", 1)])
+            docs = [d async for d in cursor]
+            if not docs:
+                await ctx.send(TIME_EMPTY_MESSAGE)
+                return
+
+            lines = [
+                render(TIME_ENTRY, rank=i, user=f"<@{d['user_id']}>", count=d["count"])
+                for i, d in enumerate(docs, start=1)
+            ]
+            embed = discord.Embed(title=TIME_TITLE, description=join_lines(lines), color=TIME_COLOR)
+            if TIME_FOOTER:
+                embed.set_footer(
+                    text=render(TIME_FOOTER, people=len(docs), total=sum(d["count"] for d in docs))
+                )
+            await ctx.send(embed=embed)
+        finally:
+            await self._delete_message(ctx.message)
+
+    @time_group.command(name="view")
+    @commands.guild_only()
+    async def time_view(self, ctx, member: discord.Member = None):
+        """Show one person's record: time view @user (yourself if no user given)"""
+        member = member or ctx.author
+        try:
+            count = await self._get_record(member.id)
+            await ctx.send(
+                render(TIME_VIEW_MESSAGE, user=member.mention, count=count),
+                allowed_mentions=NO_MENTIONS,
+            )
+        finally:
+            await self._delete_message(ctx.message)
+
+    @time_group.command(name="change")
+    @commands.guild_only()
+    async def time_change(self, ctx, member: discord.Member, count: int):
+        """(Administrator) Set someone's record: time change @user <number>"""
+        try:
+            if not ctx.author.guild_permissions.administrator:
+                await ctx.send(TIME_NO_PERMISSION_MESSAGE)
+                return
+            if count < 0:
+                await ctx.send(TIME_INVALID_MESSAGE)
+                return
+
+            await self.coll.update_one(
+                {"_id": f"count:{member.id}"},
+                {"$set": {"count": count, "user_id": member.id}},
+                upsert=True,
+            )
+            await ctx.send(
+                render(TIME_CHANGE_MESSAGE, user=member.mention, count=count, admin=ctx.author.mention),
+                allowed_mentions=NO_MENTIONS,
+            )
+        finally:
+            await self._delete_message(ctx.message)
 
     # ----------------------------- reactions ----------------------------
 
@@ -170,7 +379,7 @@ class City(commands.Cog):
         emoji = str(payload.emoji)
 
         if emoji.startswith(THUMBS_UP):
-            # Still in the city -> stop re-pinging and restart the 1 hour timer
+            # Still in the city -> restart the 1 hour timer (also deletes the reminders)
             await self._start_timer(user_id)
 
         elif emoji.startswith(THUMBS_DOWN):
@@ -178,7 +387,7 @@ class City(commands.Cog):
             if guild is None:
                 return
             try:
-                await self._leave_city(guild, user_id)
+                await self._leave_city(guild, user_id)  # also deletes the reminders
             except discord.Forbidden:
                 logger.warning("Missing permission to remove the city role from %s", user_id)
 
