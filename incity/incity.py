@@ -391,7 +391,7 @@ class City(commands.Cog):
     @commands.group(name="time", invoke_without_command=True)
     @commands.guild_only()
     async def time_group(self, ctx):
-        """Show how many times each person has enabled the city.
+        """Show how many times each person has joined the city.
         Subcommands: time view [@user], time change @user <number> (admins)"""
         try:
             cursor = self.coll.find({"count": {"$gt": 0}}).sort([("count", -1), ("user_id", 1)])
