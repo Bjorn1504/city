@@ -1,9 +1,11 @@
 import asyncio
 import logging
 import time
+from typing import Union
 
 import discord
 from discord.ext import commands
+from pymongo import UpdateOne
 
 logger = logging.getLogger("Modmail")
 
@@ -46,6 +48,8 @@ TIME_ENTRY = "**{rank}.** {user} — {count}"  # Placeholders: {rank}, {user}, {
 TIME_FOOTER = "{people} people · {total} total"  # Placeholders: {people}, {total}. Use "" for no footer
 TIME_VIEW_MESSAGE = "{user} has joined the city {count} time(s)."  # {user}, {count}
 TIME_CHANGE_MESSAGE = "{admin} set {user}'s city record to {count}."  # {user}, {count}, {admin}
+TIME_CHANGE_ROLE_MESSAGE = "{admin} set the city record of {people} member(s) with {role} to {count}."  # {admin}, {role}, {people}, {count}
+TIME_ROLE_EMPTY_MESSAGE = "No one has {role}."  # {role}
 TIME_NO_PERMISSION_MESSAGE = "You need the Administrator permission to change records."
 TIME_INVALID_MESSAGE = "The record must be 0 or higher."
 # --------------------------------------------------------------------
@@ -425,8 +429,9 @@ class City(commands.Cog):
 
     @time_group.command(name="change")
     @commands.guild_only()
-    async def time_change(self, ctx, member: discord.Member, count: int):
-        """(Administrator) Set someone's record: time change @user <number>"""
+    async def time_change(self, ctx, target: Union[discord.Member, discord.Role], count: int):
+        """(Administrator) Set a record: time change @user <number>
+        Or set it for everyone with a role: time change @role <number>"""
         try:
             if not ctx.author.guild_permissions.administrator:
                 await ctx.send(TIME_NO_PERMISSION_MESSAGE)
@@ -435,17 +440,56 @@ class City(commands.Cog):
                 await ctx.send(TIME_INVALID_MESSAGE)
                 return
 
+            # ---- a role: mass-change everyone who has it (bots are skipped) ----
+            if isinstance(target, discord.Role):
+                members = [m for m in target.members if not m.bot]
+                if not members:
+                    await ctx.send(
+                        render(TIME_ROLE_EMPTY_MESSAGE, role=target.mention),
+                        allowed_mentions=NO_MENTIONS,
+                    )
+                    return
+
+                await self.coll.bulk_write(
+                    [
+                        UpdateOne(
+                            {"_id": f"count:{m.id}"},
+                            {"$set": {"count": count, "user_id": m.id}},
+                            upsert=True,
+                        )
+                        for m in members
+                    ],
+                    ordered=False,
+                )
+                await ctx.send(
+                    render(
+                        TIME_CHANGE_ROLE_MESSAGE,
+                        admin=ctx.author.mention,
+                        role=target.mention,
+                        people=len(members),
+                        count=count,
+                    ),
+                    allowed_mentions=NO_MENTIONS,
+                )
+                await self._log(
+                    f"ℹ️ {ctx.author.mention} set the city record of {len(members)} member(s) "
+                    f"with {target.mention} to {count}.",
+                    logging.INFO,
+                )
+                return
+
+            # ---- a single member ----
             await self.coll.update_one(
-                {"_id": f"count:{member.id}"},
-                {"$set": {"count": count, "user_id": member.id}},
+                {"_id": f"count:{target.id}"},
+                {"$set": {"count": count, "user_id": target.id}},
                 upsert=True,
             )
             await ctx.send(
-                render(TIME_CHANGE_MESSAGE, user=member.mention, count=count, admin=ctx.author.mention),
+                render(TIME_CHANGE_MESSAGE, user=target.mention, count=count, admin=ctx.author.mention),
                 allowed_mentions=NO_MENTIONS,
             )
             await self._log(
-                f"ℹ️ {ctx.author.mention} set <@{member.id}>'s city record to {count}.",
+                f"ℹ️ {ctx.author.mention} set <@{target.id}>'s city record to {count}.",
                 logging.INFO,
             )
         finally:
