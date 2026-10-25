@@ -9,7 +9,7 @@ logger = logging.getLogger("Modmail")
 
 # ------------------------------ CONFIG ------------------------------
 CHANNEL_ID = 1506363908405854424  # channel where the messages are sent
-ROLE_ID = 0  # <-- REPLACE with the ID of your "in city" role
+ROLE_ID = 1563945182599057568  # <-- REPLACE with the ID of your "in city" role
 REMINDER_DELAY = 60 * 60  # seconds until the first reminder (1 hour)
 REPING_DELAY = 15 * 60  # seconds between re-pings if they don't respond (15 min)
 THUMBS_UP = "\N{THUMBS UP SIGN}"
