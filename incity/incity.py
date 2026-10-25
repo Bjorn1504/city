@@ -292,7 +292,7 @@ class City(commands.Cog):
     @commands.command()
     @commands.guild_only()
     async def city(self, ctx, member: discord.Member = None):
-        """Toggle the "in city" role for yourself, or for someone else: city @user"""
+        """Let people know you're in city."""
         member = member or ctx.author
         try:
             await self._toggle(ctx, member)
@@ -430,7 +430,7 @@ class City(commands.Cog):
     @time_group.command(name="change")
     @commands.guild_only()
     async def time_change(self, ctx, target: Union[discord.Member, discord.Role], count: int):
-        """(Administrator) Set a record: time change @user <number>
+        """Set a record: time change @user <number>
         Or set it for everyone with a role: time change @role <number>"""
         try:
             if not ctx.author.guild_permissions.administrator:
