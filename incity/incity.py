@@ -8,20 +8,28 @@ from discord.ext import commands
 logger = logging.getLogger("Modmail")
 
 # ------------------------------ CONFIG ------------------------------
-CHANNEL_ID = 1506363879121354884  # channel where the city messages are sent
-ROLE_ID = 1563945182599057568  # <-- REPLACE with the ID of your "in city" role
+CHANNEL_ID1 = 1506363879121354884  # where the city messages are sent
+CHANNEL_ID2 = 1506363914550771742  # where the bot's warnings / errors / logs are sent
+ROLE_ID = 1563945182599057568  # the "in city" role
 
 # ---- .city messages ------------------------------------------------
 # Placeholders: {user} (mention), {time} (timestamp)
 ENABLE_MESSAGE = "{user} is in city at {time}."
 DISABLE_MESSAGE = "{user} left the city at {time}."
-REMINDER_MESSAGE = "{user}, are you still in the city?"
+REMINDER_MESSAGE = "{user}, have you left the city yet?"
 
-REMINDER_DELAY = 1 * 60  # seconds until the first reminder (1 hour)
-REPING_DELAY = 1 * 60  # seconds between re-pings if they don't respond (15 min)
+REMINDER_DELAY = 60 * 60  # seconds until the first reminder (1 hour)
+REPING_DELAY = 15 * 60  # seconds between re-pings if they don't respond (15 min)
 COMMAND_DELETE_DELAY = 3  # seconds the bot's 👍 stays visible when disabling, before the command message is deleted
 THUMBS_UP = "\N{THUMBS UP SIGN}"
 THUMBS_DOWN = "\N{THUMBS DOWN SIGN}"
+
+# ---- Reminder (sent to the person's DMs as an embed) ----------------
+REMINDER_TITLE = "Check-in"
+REMINDER_COLOR = 0x2ECC71  # embed color (hex)
+REMINDER_ENTRY = REMINDER_MESSAGE  # embed text. Placeholders: {user}, {time}
+REMINDER_FOOTER = "ONLY REACT TO THIS MESSAGE, DO NOT SEND A MESSAGE."  # use "" for no footer
+DM_FAILURES_BEFORE_CHANNEL = 2  # after this many failed DMs in a row, post the reminder in CHANNEL_ID1 instead
 
 # ---- .who ----------------------------------------------------------
 WHO_EMPTY_MESSAGE = "No one is in the city right now."  # sent when nobody has the role
@@ -36,7 +44,7 @@ TIME_TITLE = "City records"
 TIME_COLOR = 0x2ECC71  # embed color (hex)
 TIME_ENTRY = "**{rank}.** {user} — {count}"  # Placeholders: {rank}, {user}, {count}
 TIME_FOOTER = "{people} people · {total} total"  # Placeholders: {people}, {total}. Use "" for no footer
-TIME_VIEW_MESSAGE = "{user} has been in the city {count} time(s)."  # {user}, {count}
+TIME_VIEW_MESSAGE = "{user} has enabled the city {count} time(s)."  # {user}, {count}
 TIME_CHANGE_MESSAGE = "{admin} set {user}'s city record to {count}."  # {user}, {count}, {admin}
 TIME_NO_PERMISSION_MESSAGE = "You need the Administrator permission to change records."
 TIME_INVALID_MESSAGE = "The record must be 0 or higher."
@@ -82,7 +90,9 @@ class City(commands.Cog):
         self.bot = bot
         self.coll = bot.api.get_plugin_partition(self)
         self.tasks: dict[int, asyncio.Task] = {}  # user_id -> running timer
-        self.pending: dict[int, set[int]] = {}  # user_id -> their reminder message ids
+        # user_id -> {reminder message id: channel id it was sent in (None = their DMs)}
+        self.pending: dict[int, dict[int, int | None]] = {}
+        self.dm_failures: dict[int, int] = {}  # user_id -> failed DMs in a row
 
     # ---------------------------- lifecycle ----------------------------
 
@@ -91,11 +101,11 @@ class City(commands.Cog):
         # Timer docs have a "due" field (records for .time are stored separately).
         async for doc in self.coll.find({"due": {"$exists": True}}):
             user_id = doc["_id"]
-            ids = doc.get("reminder_ids")
-            if ids is None and doc.get("reminder_id"):  # older saved format
-                ids = [doc["reminder_id"]]
-            if ids:
-                self.pending[user_id] = set(ids)
+            reminders = {int(k): v for k, v in (doc.get("reminders") or {}).items()}
+            for message_id in doc.get("reminder_ids") or []:  # older saved format (DM reminders)
+                reminders.setdefault(message_id, None)
+            if reminders:
+                self.pending[user_id] = reminders
             self._schedule(user_id, max(0, doc["due"] - time.time()))
 
     async def cog_unload(self):
@@ -105,8 +115,17 @@ class City(commands.Cog):
 
     # ----------------------------- helpers -----------------------------
 
-    async def _get_channel(self):
-        return self.bot.get_channel(CHANNEL_ID) or await self.bot.fetch_channel(CHANNEL_ID)
+    async def _get_channel(self, channel_id: int = CHANNEL_ID1):
+        return self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+
+    async def _log(self, text: str, level: int = logging.WARNING, exc_info: bool = False):
+        """Write to the console and post to the log channel (CHANNEL_ID2)."""
+        logger.log(level, text, exc_info=exc_info)
+        try:
+            channel = await self._get_channel(CHANNEL_ID2)
+            await channel.send(text[:2000], allowed_mentions=NO_MENTIONS)
+        except Exception:
+            logger.exception("Couldn't post to the city log channel")
 
     async def _delete_message(self, message: discord.Message):
         try:
@@ -114,17 +133,21 @@ class City(commands.Cog):
         except discord.HTTPException:
             pass  # already gone, or missing Manage Messages
 
-    async def _delete_reminders(self, message_ids):
-        """Delete the bot's reminder messages in the city channel."""
-        if not message_ids:
+    async def _delete_reminders(self, user_id: int, reminders: dict):
+        """Delete the bot's reminder messages (from the person's DMs or from CHANNEL_ID1)."""
+        if not reminders:
             return
-        try:
-            channel = await self._get_channel()
-        except discord.HTTPException:
-            return
-        for message_id in message_ids:
+        dm = None
+        for message_id, channel_id in reminders.items():
             try:
-                await channel.get_partial_message(message_id).delete()
+                if channel_id is None:
+                    if dm is None:
+                        user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+                        dm = user.dm_channel or await user.create_dm()
+                    await dm.get_partial_message(message_id).delete()
+                else:
+                    channel = await self._get_channel(channel_id)
+                    await channel.get_partial_message(message_id).delete()
             except discord.HTTPException:
                 pass  # already deleted
 
@@ -141,20 +164,25 @@ class City(commands.Cog):
         """(Re)start the 1 hour timer, save it, and delete any old reminders.
         entering=True marks the moment the person entered the city (used by .who)."""
         self._cancel_task(user_id)
-        old_ids = self.pending.pop(user_id, set())
-        update = {"due": time.time() + delay, "reminder_ids": []}
+        old = self.pending.pop(user_id, {})
+        update = {"due": time.time() + delay, "reminders": {}}
         if entering:
             update["since"] = time.time()
-        await self.coll.update_one({"_id": user_id}, {"$set": update}, upsert=True)
+        await self.coll.update_one(
+            {"_id": user_id},
+            {"$set": update, "$unset": {"reminder_ids": ""}},
+            upsert=True,
+        )
         self._schedule(user_id, delay)
-        await self._delete_reminders(old_ids)
+        await self._delete_reminders(user_id, old)
 
     async def _clear(self, user_id: int):
         """Forget this user's timer and delete any outstanding reminders."""
         self._cancel_task(user_id)
-        old_ids = self.pending.pop(user_id, set())
+        old = self.pending.pop(user_id, {})
+        self.dm_failures.pop(user_id, None)
         await self.coll.delete_one({"_id": user_id})
-        await self._delete_reminders(old_ids)
+        await self._delete_reminders(user_id, old)
 
     async def _timer(self, user_id: int, delay: float):
         """Wait, send the reminder, then keep re-pinging until this task is cancelled
@@ -165,21 +193,62 @@ class City(commands.Cog):
             while True:
                 try:
                     await self._send_reminder(user_id)
-                except Exception:
-                    logger.exception("City reminder failed for user %s", user_id)
+                except Exception as exc:
+                    await self._log(
+                        f"❌ City reminder failed for <@{user_id}>: `{type(exc).__name__}: {exc}`",
+                        logging.ERROR,
+                        exc_info=True,
+                    )
                 await asyncio.sleep(REPING_DELAY)
         except asyncio.CancelledError:
             raise
 
     async def _send_reminder(self, user_id: int):
-        channel = await self._get_channel()
-        msg = await channel.send(fmt(REMINDER_MESSAGE, user_id))
-        self.pending.setdefault(user_id, set()).add(msg.id)
+        """DM the person an embed reminder. If DMs fail DM_FAILURES_BEFORE_CHANNEL times
+        in a row, post it (with a ping) in CHANNEL_ID1 instead."""
+        embed = discord.Embed(
+            title=REMINDER_TITLE,
+            description=fmt(REMINDER_ENTRY, user_id),
+            color=REMINDER_COLOR,
+        )
+        if REMINDER_FOOTER:
+            embed.set_footer(text=REMINDER_FOOTER)
+
+        channel_id = None  # None = delivered by DM
+        try:
+            user = self.bot.get_user(user_id) or await self.bot.fetch_user(user_id)
+            msg = await user.send(embed=embed)
+            self.dm_failures.pop(user_id, None)  # DMs work
+        except discord.Forbidden:
+            fails = self.dm_failures.get(user_id, 0) + 1
+            self.dm_failures[user_id] = fails
+            await self.coll.update_one(
+                {"_id": user_id}, {"$set": {"due": time.time() + REPING_DELAY}}
+            )
+
+            if fails < DM_FAILURES_BEFORE_CHANNEL:
+                await self._log(
+                    f"⚠️ Couldn't DM the city reminder to <@{user_id}> (their DMs may be closed). "
+                    f"Failed DMs in a row: {fails}. I'll try again at the next re-ping."
+                )
+                return
+
+            channel = await self._get_channel(CHANNEL_ID1)
+            msg = await channel.send(f"<@{user_id}>", embed=embed)  # the mention pings them
+            channel_id = CHANNEL_ID1
+            await self._log(
+                f"⚠️ Couldn't DM <@{user_id}> ({fails} failed DMs in a row), "
+                f"so I sent their reminder in <#{CHANNEL_ID1}> instead."
+            )
+
+        self.pending.setdefault(user_id, {})[msg.id] = channel_id
         await self.coll.update_one(
             {"_id": user_id},
             {
-                "$push": {"reminder_ids": msg.id},
-                "$set": {"due": time.time() + REPING_DELAY},  # next re-ping
+                "$set": {
+                    f"reminders.{msg.id}": channel_id,
+                    "due": time.time() + REPING_DELAY,  # next re-ping
+                }
             },
         )
         await msg.add_reaction(THUMBS_UP)
@@ -230,6 +299,7 @@ class City(commands.Cog):
         role = ctx.guild.get_role(ROLE_ID)
         if role is None:
             await ctx.send("The city role wasn't found. Check `ROLE_ID` in the plugin.")
+            await self._log(f"❌ `.city` failed: the role `{ROLE_ID}` wasn't found.", logging.ERROR)
             return
 
         # Already has the role -> disable
@@ -242,6 +312,11 @@ class City(commands.Cog):
                 await self._leave_city(ctx.guild, member.id)
             except discord.Forbidden:
                 await ctx.send("I don't have permission to remove that role.")
+                await self._log(
+                    f"❌ I couldn't remove the city role from <@{member.id}> "
+                    "(missing permissions or role hierarchy).",
+                    logging.ERROR,
+                )
                 return
             await asyncio.sleep(COMMAND_DELETE_DELAY)  # let the 👍 be seen
             return
@@ -253,6 +328,11 @@ class City(commands.Cog):
             await ctx.send(
                 "I don't have permission to give that role. "
                 "Make sure I have **Manage Roles** and my role is above it."
+            )
+            await self._log(
+                f"❌ I couldn't give the city role to <@{member.id}> "
+                "(missing permissions or role hierarchy).",
+                logging.ERROR,
             )
             return
 
@@ -272,6 +352,7 @@ class City(commands.Cog):
             role = ctx.guild.get_role(ROLE_ID)
             if role is None:
                 await ctx.send("The city role wasn't found. Check `ROLE_ID` in the plugin.")
+                await self._log(f"❌ `.who` failed: the role `{ROLE_ID}` wasn't found.", logging.ERROR)
                 return
 
             members = role.members
@@ -363,6 +444,10 @@ class City(commands.Cog):
                 render(TIME_CHANGE_MESSAGE, user=member.mention, count=count, admin=ctx.author.mention),
                 allowed_mentions=NO_MENTIONS,
             )
+            await self._log(
+                f"ℹ️ {ctx.author.mention} set <@{member.id}>'s city record to {count}.",
+                logging.INFO,
+            )
         finally:
             await self._delete_message(ctx.message)
 
@@ -373,7 +458,7 @@ class City(commands.Cog):
         user_id = payload.user_id
 
         # Only the pinged user reacting to one of their own reminders counts
-        if payload.message_id not in self.pending.get(user_id, ()):
+        if payload.message_id not in self.pending.get(user_id, {}):
             return
 
         emoji = str(payload.emoji)
@@ -383,13 +468,15 @@ class City(commands.Cog):
             await self._start_timer(user_id)
 
         elif emoji.startswith(THUMBS_DOWN):
-            guild = self.bot.get_guild(payload.guild_id)
-            if guild is None:
-                return
+            guild = (await self._get_channel()).guild  # reactions in DMs carry no guild_id
             try:
                 await self._leave_city(guild, user_id)  # also deletes the reminders
             except discord.Forbidden:
-                logger.warning("Missing permission to remove the city role from %s", user_id)
+                await self._log(
+                    f"❌ I couldn't remove the city role from <@{user_id}> "
+                    "(missing permissions or role hierarchy).",
+                    logging.ERROR,
+                )
 
 
 async def setup(bot):
