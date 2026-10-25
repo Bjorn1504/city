@@ -16,7 +16,7 @@ ROLE_ID = 1563945182599057568  # the "in city" role
 # Placeholders: {user} (mention), {time} (timestamp)
 ENABLE_MESSAGE = "{user} is in city at {time}."
 DISABLE_MESSAGE = "{user} left the city at {time}."
-REMINDER_MESSAGE = "{user}, have you left the city yet?"
+REMINDER_MESSAGE = "{user}, are you still in city?"
 
 REMINDER_DELAY = 1 * 60  # seconds until the first reminder (1 hour)
 REPING_DELAY = 1 * 60  # seconds between re-pings if they don't respond (15 min)
@@ -26,7 +26,7 @@ THUMBS_DOWN = "\N{THUMBS DOWN SIGN}"
 
 # ---- Reminder (sent to the person's DMs as an embed) ----------------
 REMINDER_TITLE = "Check-in"
-REMINDER_COLOR = 0x2ECC71  # embed color (hex)
+REMINDER_COLOR = ff0000  # embed color (hex)
 REMINDER_ENTRY = REMINDER_MESSAGE  # embed text. Placeholders: {user}, {time}
 REMINDER_FOOTER = "ONLY REACT TO THIS MESSAGE, DO NOT SEND A MESSAGE."  # use "" for no footer
 DM_FAILURES_BEFORE_CHANNEL = 2  # after this many failed DMs in a row, post the reminder in CHANNEL_ID1 instead
@@ -34,17 +34,17 @@ DM_FAILURES_BEFORE_CHANNEL = 2  # after this many failed DMs in a row, post the 
 # ---- .who ----------------------------------------------------------
 WHO_EMPTY_MESSAGE = "No one is in the city right now."  # sent when nobody has the role
 WHO_TITLE = "Who's in the city"
-WHO_COLOR = 0x3498DB  # embed color (hex)
+WHO_COLOR = ffffff  # embed color (hex)
 WHO_ENTRY = "{user} — since {time}"  # one line per person. Placeholders: {user}, {time}, {ago}
 WHO_FOOTER = "{count} in the city"  # Placeholders: {count}. Use "" for no footer
 
 # ---- .time ---------------------------------------------------------
 TIME_EMPTY_MESSAGE = "Nobody has a city record yet."
 TIME_TITLE = "City records"
-TIME_COLOR = 0x2ECC71  # embed color (hex)
+TIME_COLOR = ffff00  # embed color (hex)
 TIME_ENTRY = "**{rank}.** {user} — {count}"  # Placeholders: {rank}, {user}, {count}
 TIME_FOOTER = "{people} people · {total} total"  # Placeholders: {people}, {total}. Use "" for no footer
-TIME_VIEW_MESSAGE = "{user} has enabled the city {count} time(s)."  # {user}, {count}
+TIME_VIEW_MESSAGE = "{user} has joined the city {count} time(s)."  # {user}, {count}
 TIME_CHANGE_MESSAGE = "{admin} set {user}'s city record to {count}."  # {user}, {count}, {admin}
 TIME_NO_PERMISSION_MESSAGE = "You need the Administrator permission to change records."
 TIME_INVALID_MESSAGE = "The record must be 0 or higher."
