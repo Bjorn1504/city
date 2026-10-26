@@ -20,8 +20,8 @@ ENABLE_MESSAGE = "{user} is in city at {time}."
 DISABLE_MESSAGE = "{user} left the city at {time}."
 REMINDER_MESSAGE = "{user}, are you still in city?"
 
-REMINDER_DELAY = 1 * 60  # seconds until the first reminder (1 hour)
-REPING_DELAY = 1 * 60  # seconds between re-pings if they don't respond (15 min)
+REMINDER_DELAY = 60 * 60  # seconds until the first reminder (1 hour)
+REPING_DELAY = 15 * 60  # seconds between re-pings if they don't respond (15 min)
 COMMAND_DELETE_DELAY = 3  # seconds the bot's 👍 stays visible when disabling, before the command message is deleted
 THUMBS_UP = "\N{THUMBS UP SIGN}"
 THUMBS_DOWN = "\N{THUMBS DOWN SIGN}"
